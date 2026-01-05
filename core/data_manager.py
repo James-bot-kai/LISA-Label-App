@@ -1,6 +1,7 @@
 import os
 import json
 import shutil
+import numpy as np
 
 
 class DataManager:
@@ -33,3 +34,16 @@ class DataManager:
     def delete_current_file(self):
         # 实现移动到回收站逻辑
         pass
+    def load_json_dataset(self, json_path):
+        """加载生成的 JSON 数据集"""
+        with open(json_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+    def load_npy_image(self, npy_path):
+        """加载 .npy 格式图像"""
+        if os.path.exists(npy_path):
+            data = np.load(npy_path)
+            # 4通道取前3通道作为RGB
+            if len(data.shape) == 3 and data.shape[-1] >= 3:
+                return data[..., :3].astype(np.uint8)
+        return None
