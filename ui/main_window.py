@@ -563,6 +563,7 @@ class MainWindow(QMainWindow):
         """下一条"""
         current_row = self.file_list_widget.currentRow()
         if current_row < self.file_list_widget.count() - 1:
+            self._auto_save_current()
             self.file_list_widget.setCurrentRow(current_row + 1)
 
     def translate_text(self):
@@ -598,3 +599,119 @@ class MainWindow(QMainWindow):
             self.translated_text.setPlainText(translated)
         except Exception as e:
             self.translated_text.setPlainText(f"翻译失败: {e}")
+
+    def _save_json_item(self):
+        """保存 JSON 模式下的修改"""
+        if not self.json_path:
+            QMessageBox.warning(self, "警告", "没有加载 JSON 文件")
+            return
+
+        if self.json_current_index < 0 or self.json_current_index >= len(self.json_data):
+            return
+
+        item = self.json_data[self.json_current_index]
+
+        # 1. 解析编辑器中的对话内容并更新 JSON
+        text_content = self.text_editor.toPlainText()
+        new_conversations = self._parse_conversations(text_content)
+        if new_conversations:
+            item['conversations'] = new_conversations
+
+        # 2. 保存当前 mask 到文件
+        if self.current_mask is not None:
+            mask_path = item.get('mask_path', '') or item.get('training_mask_path', '')
+            if mask_path:
+                mask_to_save = (self.current_mask * 255).astype(np.uint8)
+                cv2.imwrite(mask_path, mask_to_save)
+                print(f"Mask 已保存: {mask_path}")
+
+        # 3. 保存 JSON 文件
+        try:
+            with open(self.json_path, 'w', encoding='utf-8') as f:
+                json.dump(self.json_data, f, ensure_ascii=False, indent=4)
+            QMessageBox.information(self, "成功", f"已保存到:\n{self.json_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"保存失败: {e}")
+
+    def _parse_conversations(self, text: str) -> list:
+        """将编辑器文本解析回 conversations 格式"""
+        if not text.strip():
+            return []
+
+        conversations = []
+        # 按角色标记分割
+        parts = text.split('👤 Human:')
+
+        for part in parts:
+            if not part.strip():
+                continue
+
+            # 检查是否包含 GPT 回复
+            if '🤖 GPT:' in part:
+                human_gpt = part.split('🤖 GPT:')
+                human_text = human_gpt[0].strip()
+                gpt_text = human_gpt[1].strip() if len(human_gpt) > 1 else ''
+
+                if human_text:
+                    conversations.append({
+                        'from': 'human',
+                        'value': human_text
+                    })
+                if gpt_text:
+                    conversations.append({
+                        'from': 'gpt',
+                        'value': gpt_text
+                    })
+            else:
+                # 只有 human 部分
+                human_text = part.strip()
+                if human_text:
+                    conversations.append({
+                        'from': 'human',
+                        'value': human_text
+                    })
+
+        return conversations
+
+    def _auto_save_current(self):
+        """静默自动保存（不弹窗提示）"""
+        if self.current_mode == "folder":
+            self._auto_save_folder_item()
+        else:
+            self._auto_save_json_item()
+
+    def _auto_save_folder_item(self):
+        """自动保存文件夹模式"""
+        if self.current_image is None or self.current_mask is None:
+            return
+        text_content = self.text_editor.toPlainText()
+        self.data_manager.save_annotation(self.current_mask, text_content)
+        print("已自动保存")
+
+    def _auto_save_json_item(self):
+        """自动保存 JSON 模式（无弹窗）"""
+        if not self.json_path or self.json_current_index < 0:
+            return
+
+        item = self.json_data[self.json_current_index]
+
+        # 1. 解析对话内容
+        text_content = self.text_editor.toPlainText()
+        new_conversations = self._parse_conversations(text_content)
+        if new_conversations:
+            item['conversations'] = new_conversations
+
+        # 2. 保存 Mask
+        if self.current_mask is not None:
+            mask_path = item.get('mask_path', '') or item.get('training_mask_path', '')
+            if mask_path:
+                mask_to_save = (self.current_mask * 255).astype(np.uint8)
+                cv2.imwrite(mask_path, mask_to_save)
+
+        # 3. 保存 JSON
+        try:
+            with open(self.json_path, 'w', encoding='utf-8') as f:
+                json.dump(self.json_data, f, ensure_ascii=False, indent=4)
+            print(f"已自动保存: {self.json_path}")
+        except Exception as e:
+            print(f"自动保存失败: {e}")
