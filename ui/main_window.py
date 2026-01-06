@@ -12,7 +12,8 @@ from pathlib import Path
 from ui.widgets.canvas import InteractiveCanvas
 from core.sam_engine import SAMEngine
 from core.data_manager import DataManager
-from utils.translate import BaiduTranslator
+#from utils.translate import BaiduTranslator
+from utils.aiTranslate import BaiduTranslator
 
 
 class MainWindow(QMainWindow):
@@ -39,7 +40,8 @@ class MainWindow(QMainWindow):
 
         self.translator = BaiduTranslator(
             appid='20260105002533609',
-            appkey='fIFodJNEMlRAetRHM8Ec'
+            #appkey='fIFodJNEMlRAetRHM8Ec',
+            api_key = '8qBw_d5do3deol13gd3crgg7g'
         )
 
         # 2. 初始化 UI
