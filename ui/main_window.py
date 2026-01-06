@@ -5,14 +5,15 @@ import numpy as np
 from PyQt6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout, QWidget,
                              QFileDialog, QListWidget, QPushButton, QTextEdit,
                              QLabel, QSplitter, QMessageBox, QFrame, QGroupBox,
-                             QStackedWidget, QButtonGroup, QRadioButton)
+                             QRadioButton)
 from PyQt6.QtCore import pyqtSlot, Qt
 from pathlib import Path
 
+# 确保引入的是修改过支持 set_preview_mask 的 Canvas
 from ui.widgets.canvas import InteractiveCanvas
 from core.sam_engine import SAMEngine
 from core.data_manager import DataManager
-#from utils.translate import BaiduTranslator
+# from utils.translate import BaiduTranslator # 根据实际情况取消注释
 from utils.aiTranslate import BaiduTranslator
 
 
@@ -24,10 +25,13 @@ class MainWindow(QMainWindow):
 
         # 1. 初始化后端逻辑模块
         self.data_manager = DataManager()
+        # 请确保路径正确，且文件已下载
         self.sam_engine = SAMEngine(checkpoint_path="checkpoints/sam_vit_b_01ec64.pth")
 
         # --- 交互状态缓存 (State) ---
         self.current_image = None
+        self.base_mask = None  # 永久层：从文件加载或已合并的 Mask (显示为红色)
+        self.sam_mask = None  # 临时层：SAM 当前预测的 Mask (显示为绿色)
         self.input_points = []
         self.input_labels = []
         self.current_mask = None
@@ -38,10 +42,10 @@ class MainWindow(QMainWindow):
         self.json_current_index = -1
         self.current_mode = "folder"  # "folder" 或 "json"
 
+        # 翻译器初始化
         self.translator = BaiduTranslator(
             appid='20260105002533609',
-            #appkey='fIFodJNEMlRAetRHM8Ec',
-            api_key = '8qBw_d5do3deol13gd3crgg7g'
+            api_key='8qBw_d5do3deol13gd3crgg7g'
         )
 
         # 2. 初始化 UI
@@ -115,31 +119,46 @@ class MainWindow(QMainWindow):
         # 操作说明
         info_label = QLabel(
             "<b>操作说明:</b><br>"
-            "左键: 添加前景点<br>"
-            "右键: 添加背景点<br>"
-            "中键拖拽: 平移图像"
+            "左键: 添加前景点 (预测)<br>"
+            "右键: 添加背景点 (修正)<br>"
+            "空格: 确认添加 (变红)<br>"
+            "Del : 确认移除 (擦除)<br>"
+            "Esc : 取消当前预览"
         )
         info_label.setTextFormat(Qt.TextFormat.RichText)
         right_layout.addWidget(info_label)
 
-        # SAM 控制按钮
-        self.btn_reset_mask = QPushButton("↺ 重置 Mask")
-        self.btn_reset_mask.clicked.connect(self.reset_sam_state)
+        # SAM 重置按钮
+        self.btn_reset_mask = QPushButton("↺ 取消当前 SAM 预览")
+        self.btn_reset_mask.clicked.connect(self.reset_sam_interaction)
         right_layout.addWidget(self.btn_reset_mask)
 
+        # === 增删改操作按钮组 ===
+        action_layout = QHBoxLayout()
+        self.btn_add_mask = QPushButton("➕ 确认添加 (Space)")
+        self.btn_add_mask.setStyleSheet("background-color: #5cb85c; color: white; font-weight: bold;")
+        self.btn_add_mask.clicked.connect(self.apply_sam_merge)
+
+        self.btn_sub_mask = QPushButton("➖ 确认移除 (Del)")
+        self.btn_sub_mask.setStyleSheet("background-color: #d9534f; color: white; font-weight: bold;")
+        self.btn_sub_mask.clicked.connect(self.apply_sam_subtract)
+
+        action_layout.addWidget(self.btn_add_mask)
+        action_layout.addWidget(self.btn_sub_mask)
+        right_layout.addLayout(action_layout)
+
         # 文本输入区域
-        # 文本输入区域（替换原有的文本编辑器部分）
         lbl_text = QLabel("对话/推理文本:")
         self.text_editor = QTextEdit()
         self.text_editor.setPlaceholderText("输入推理文本...")
         right_layout.addWidget(lbl_text)
         right_layout.addWidget(self.text_editor)
 
-        # 翻译按钮（现在隐藏了）
+        # 翻译按钮
         self.btn_translate = QPushButton("🌐 翻译为中文")
         self.btn_translate.setStyleSheet("height: 35px; font-weight: bold;")
         self.btn_translate.clicked.connect(self.translate_text)
-        self.btn_translate.setVisible(False)  # 隐藏手动翻译按钮
+        self.btn_translate.setVisible(False)
         right_layout.addWidget(self.btn_translate)
 
         # 翻译结果区域
@@ -178,17 +197,13 @@ class MainWindow(QMainWindow):
 
         # 删除按钮
         self.btn_delete = QPushButton("🗑 删除当前条目")
-        self.btn_delete.setStyleSheet(
-            "background-color: #d9534f; color: white; height: 40px; font-weight: bold;"
-        )
+        self.btn_delete.setStyleSheet("background-color: #d9534f; color: white; height: 40px; font-weight: bold;")
         self.btn_delete.clicked.connect(self.delete_current_item)
         right_layout.addWidget(self.btn_delete)
 
         # 保存按钮
         self.btn_save = QPushButton("💾 保存修改")
-        self.btn_save.setStyleSheet(
-            "background-color: #5cb85c; color: white; height: 40px; font-weight: bold;"
-        )
+        self.btn_save.setStyleSheet("background-color: #5cb85c; color: white; height: 40px; font-weight: bold;")
         self.btn_save.clicked.connect(self.save_current)
         right_layout.addWidget(self.btn_save)
 
@@ -215,14 +230,17 @@ class MainWindow(QMainWindow):
             self.btn_load_dir.setVisible(False)
             self.btn_load_json.setVisible(True)
 
-        # 清空列表
+        # 清空状态
         self.file_list_widget.clear()
         self.stats_label.setText("共 0 条数据")
         self.canvas.set_image(None)
         self.canvas.set_mask(None)
+        self.canvas.set_preview_mask(None)
         self.meta_text.clear()
         self.text_editor.clear()
         self.translated_text.clear()
+        self.base_mask = None
+        self.sam_mask = None
 
     # ==========================
     # 文件夹模式
@@ -240,9 +258,7 @@ class MainWindow(QMainWindow):
 
     def on_file_selected(self, index):
         """列表选中事件"""
-        if index < 0:
-            return
-
+        if index < 0: return
         if self.current_mode == "folder":
             self._load_folder_item(index)
         else:
@@ -253,25 +269,28 @@ class MainWindow(QMainWindow):
         self.data_manager.current_index = index
         img_path, json_path = self.data_manager.get_current_data()
 
-        if not img_path:
-            return
-
+        if not img_path: return
         img = cv2.imread(img_path)
-        if img is None:
-            QMessageBox.warning(self, "错误", f"无法读取图片: {img_path}")
-            return
+        if img is None: return
 
         self.current_image = img
         self.canvas.set_image(img)
         self.sam_engine.set_image(img)
-        self.reset_sam_state()
+
+        # 初始化 Base Mask (全黑)
+        h, w = img.shape[:2]
+        self.base_mask = np.zeros((h, w), dtype=np.uint8)
+
+        # 重置 SAM
+        self.sam_mask = None
+        self.input_points = []
+        self.input_labels = []
+
+        # 关键：更新显示
+        self.update_canvas_display()
 
         self.meta_text.setPlainText(f"文件: {img_path}")
-
-        if json_path and os.path.exists(json_path):
-            self.text_editor.clear()
-        else:
-            self.text_editor.clear()
+        self.text_editor.clear()
 
     # ==========================
     # JSON 模式
@@ -288,7 +307,6 @@ class MainWindow(QMainWindow):
                     self.json_data = json.load(f)
                 self.json_path = file_path
 
-                # 填充列表
                 self.file_list_widget.clear()
                 for item in self.json_data:
                     item_id = item.get('id', 'Unknown')
@@ -297,10 +315,8 @@ class MainWindow(QMainWindow):
                     self.file_list_widget.addItem(display)
 
                 self.stats_label.setText(f"共 {len(self.json_data)} 条数据")
-
                 if self.json_data:
                     self.file_list_widget.setCurrentRow(0)
-
                 QMessageBox.information(self, "成功", f"已加载 {len(self.json_data)} 条数据")
 
             except Exception as e:
@@ -314,15 +330,11 @@ class MainWindow(QMainWindow):
         self.json_current_index = index
         item = self.json_data[index]
 
-        # 1. 加载 RGB 图像 (image_path_rgb)
+        # 1. 加载图片
         rgb_path = item.get('image_path_rgb', '')
         img = None
-
         if rgb_path and Path(rgb_path).exists():
             img = cv2.imread(rgb_path)
-            print(f"加载图像: {rgb_path}")
-        else:
-            print(f"图像不存在: {rgb_path}")
 
         if img is not None:
             self.current_image = img
@@ -331,42 +343,43 @@ class MainWindow(QMainWindow):
         else:
             self.current_image = None
             self.canvas.set_image(None)
+            print(f"图像不存在: {rgb_path}")
+            return
 
-        # 2. 加载 Mask (mask_path)
-        mask_path = item.get('mask_path', '')
+        # 2. 加载 Mask (Base Mask)
+        mask_path = item.get('mask_path', '') or item.get('training_mask_path', '')
+        h, w = self.current_image.shape[:2]
+        self.base_mask = np.zeros((h, w), dtype=np.uint8)  # 默认全黑
+
         if mask_path and Path(mask_path).exists():
             mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
             if mask is not None:
                 _, mask_binary = cv2.threshold(mask, 127, 1, cv2.THRESH_BINARY)
-                self.current_mask = mask_binary
-                self.canvas.set_mask(mask_binary)
-                print(f"加载Mask: {mask_path}")
-            else:
-                self.current_mask = None
-                self.canvas.set_mask(None)
-                print(f"Mask读取失败: {mask_path}")
-        else:
-            self.current_mask = None
-            self.canvas.set_mask(None)
-            print(f"Mask不存在: {mask_path}")
+                if mask_binary.shape == (h, w):
+                    self.base_mask = mask_binary
+                    print(f"加载Mask: {mask_path}")
+                else:
+                    print(f"Mask尺寸不匹配: {mask_path}")
 
-        # 3. 重置点击状态
+        # 3. 重置 SAM
+        self.sam_mask = None
         self.input_points = []
         self.input_labels = []
 
-        # 4. 显示元信息
+        # 4. 刷新显示 (Base红色, SAM无)
+        self.update_canvas_display()
+
+        # 5. 显示信息
         bbox = item.get('bbox', [])
         meta_info = (
             f"ID: {item.get('id', '')}\n"
             f"BBox: {bbox}\n"
-            f"─────────────────────\n"
-            f"Image 4C: {item.get('image_path_4c', '')}\n"
             f"Image RGB: {rgb_path}\n"
             f"Mask: {mask_path}"
         )
         self.meta_text.setPlainText(meta_info)
 
-        # 5. 显示对话内容并自动翻译
+        # 6. 对话
         conversations = item.get('conversations', [])
         if conversations:
             conv_text = ""
@@ -378,44 +391,186 @@ class MainWindow(QMainWindow):
                 else:
                     conv_text += f"🤖 GPT:\n{value}\n\n"
             self.text_editor.setPlainText(conv_text)
-
-            # 自动翻译
             self._auto_translate(conv_text)
         else:
             self.text_editor.setPlainText("（无对话数据）")
             self.translated_text.clear()
 
     # ==========================
-    # SAM 交互
+    # 核心：显示与合并逻辑
     # ==========================
+
+    def update_canvas_display(self):
+        """
+        强制刷新画布：
+        1. 先画底图 (红色)
+        2. 再画预览 (绿色)
+        """
+        # 1. Base Mask (Red)
+        if self.base_mask is not None:
+            self.canvas.set_mask(self.base_mask)
+        else:
+            self.canvas.set_mask(None)
+
+        # 2. SAM Mask (Green)
+        if self.sam_mask is not None:
+            self.canvas.set_preview_mask(self.sam_mask)
+        else:
+            self.canvas.set_preview_mask(None)
+
+        # 3. Sync for Saving (Base + SAM)
+        if self.base_mask is not None:
+            self.current_mask = self.base_mask.copy()
+            if self.sam_mask is not None:
+                try:
+                    if self.base_mask.shape != self.sam_mask.shape:
+                        h, w = self.base_mask.shape[:2]
+                        self.sam_mask = cv2.resize(self.sam_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+                    self.current_mask = cv2.bitwise_or(self.current_mask, self.sam_mask)
+                except Exception:
+                    pass
+        else:
+            self.current_mask = None
+
+    def apply_sam_merge(self):
+        """[确认添加] 将 SAM 预测区域并入 Base Mask"""
+        if self.base_mask is None or self.sam_mask is None:
+            return
+        # Base = Base OR SAM
+        self.base_mask = np.bitwise_or(self.base_mask, self.sam_mask)
+        print("操作：区域已添加")
+        self.reset_sam_interaction()
+
+    def apply_sam_subtract(self):
+        """[确认移除] 从 Base Mask 中减去 SAM 预测区域"""
+        if self.base_mask is None or self.sam_mask is None:
+            return
+        # Base = Base AND (NOT SAM)
+        sam_inverted = 1 - self.sam_mask
+        self.base_mask = np.bitwise_and(self.base_mask, sam_inverted)
+        print("操作：区域已移除")
+        self.reset_sam_interaction()
+
+    def reset_sam_interaction(self):
+        """重置 SAM 交互状态 (清空点和绿色预览)，保留红色底图"""
+        self.input_points = []
+        self.input_labels = []
+        self.sam_mask = None
+        self.update_canvas_display()
 
     @pyqtSlot(int, int, int)
     def handle_canvas_click(self, x, y, is_left):
         """响应画布点击"""
         if self.current_image is None:
+            print("⚠️ 点击无效：没有加载图片")
             return
 
         self.input_points.append([x, y])
         self.input_labels.append(is_left)
 
-        print(f"SAM Predicting... Points: {len(self.input_points)}")
+        label_str = "前景" if is_left == 1 else "背景"
+        print(f"🖱️ 点击: ({x}, {y}) [{label_str}] | 总点数: {len(self.input_points)}")
 
+        # 调用 SAM
         mask = self.sam_engine.predict_mask(self.input_points, self.input_labels)
 
         if mask is not None:
-            self.current_mask = mask
-            self.canvas.set_mask(mask)
+            print("✅ SAM 预测成功")
+            self.sam_mask = mask
+            # 刷新显示
+            self.update_canvas_display()
+        else:
+            print("❌ SAM 预测返回 None")
 
-    def reset_sam_state(self):
-        """清空 Mask 和点击历史"""
-        self.input_points = []
-        self.input_labels = []
-        self.current_mask = None
-        self.canvas.set_mask(None)
+    def keyPressEvent(self, event):
+        """键盘快捷键"""
+        if event.key() in (Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.apply_sam_merge()
+        elif event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            self.apply_sam_subtract()
+        elif event.key() == Qt.Key.Key_Escape:
+            self.reset_sam_interaction()
+        elif event.key() == Qt.Key.Key_Left:
+            self.navigate_prev()
+        elif event.key() == Qt.Key.Key_Right:
+            self.navigate_next()
+        else:
+            super().keyPressEvent(event)
 
     # ==========================
-    # 删除操作
+    # 保存与删除
     # ==========================
+
+    def save_current(self):
+        """保存当前修改 (手动点击保存按钮)"""
+        if self.current_mode == "folder":
+            self._save_folder_item()
+        else:
+            self._save_json_item()
+
+    def _save_folder_item(self):
+        if self.current_image is None: return
+        text_content = self.text_editor.toPlainText()
+        # 注意：这里保存的是 current_mask (即 Base + SAM 的合并结果)
+        if self.current_mask is not None:
+            self.data_manager.save_annotation(self.current_mask, text_content)
+            print("已保存")
+
+        # 自动跳转
+        next_row = self.file_list_widget.currentRow() + 1
+        if next_row < self.file_list_widget.count():
+            self.file_list_widget.setCurrentRow(next_row)
+        else:
+            QMessageBox.information(self, "完成", "所有图片已处理完毕！")
+
+    def _save_json_item(self):
+        """保存 JSON 和 Mask (手动保存)"""
+        if not self.json_path:
+            QMessageBox.warning(self, "警告", "没有加载 JSON 文件")
+            return
+        if self.json_current_index < 0: return
+
+        item = self.json_data[self.json_current_index]
+
+        # 1. 保存文本
+        text_content = self.text_editor.toPlainText()
+        new_conversations = self._parse_conversations(text_content)
+        if new_conversations:
+            item['conversations'] = new_conversations
+
+        # 2. 保存 Mask (保存 current_mask)
+        if self.current_mask is not None:
+            mask_path = item.get('mask_path', '') or item.get('training_mask_path', '')
+            if mask_path:
+                mask_to_save = (self.current_mask * 255).astype(np.uint8)
+                cv2.imwrite(mask_path, mask_to_save)
+                print(f"Mask 已保存: {mask_path}")
+
+        # 3. 写回 JSON
+        try:
+            with open(self.json_path, 'w', encoding='utf-8') as f:
+                json.dump(self.json_data, f, ensure_ascii=False, indent=4)
+            QMessageBox.information(self, "成功", f"已保存到:\n{self.json_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"保存失败: {e}")
+
+    def _parse_conversations(self, text: str) -> list:
+        """解析文本回 conversations 格式"""
+        if not text.strip(): return []
+        conversations = []
+        parts = text.split('👤 Human:')
+        for part in parts:
+            if not part.strip(): continue
+            if '🤖 GPT:' in part:
+                human_gpt = part.split('🤖 GPT:')
+                human_text = human_gpt[0].strip()
+                gpt_text = human_gpt[1].strip() if len(human_gpt) > 1 else ''
+                if human_text: conversations.append({'from': 'human', 'value': human_text})
+                if gpt_text: conversations.append({'from': 'gpt', 'value': gpt_text})
+            else:
+                human_text = part.strip()
+                if human_text: conversations.append({'from': 'human', 'value': human_text})
+        return conversations
 
     def delete_current_item(self):
         """删除当前条目"""
@@ -425,295 +580,108 @@ class MainWindow(QMainWindow):
             self._delete_json_item()
 
     def _delete_folder_item(self):
-        """删除文件夹模式下的图片"""
-        reply = QMessageBox.question(
-            self, '确认删除',
-            "确定要将此图片移入回收站吗？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
+        reply = QMessageBox.question(self, '确认删除', "确定要将此图片移入回收站吗？",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             self.data_manager.delete_current_file()
-            current_row = self.file_list_widget.currentRow()
-            self.file_list_widget.takeItem(current_row)
+            row = self.file_list_widget.currentRow()
+            self.file_list_widget.takeItem(row)
             self.stats_label.setText(f"共 {self.file_list_widget.count()} 条数据")
-
-            if current_row < self.file_list_widget.count():
-                self.file_list_widget.setCurrentRow(current_row)
+            if row < self.file_list_widget.count():
+                self.file_list_widget.setCurrentRow(row)
 
     def _delete_json_item(self):
-        """删除 JSON 模式下的条目"""
-        if self.json_current_index < 0 or self.json_current_index >= len(self.json_data):
-            QMessageBox.warning(self, "警告", "没有选中任何条目")
-            return
-
+        if self.json_current_index < 0: return
         item = self.json_data[self.json_current_index]
-        item_id = item.get('id', 'Unknown')
+        reply = QMessageBox.question(self, '确认删除', f"确定要删除 ID: {item.get('id')} 吗？",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes: return
 
-        reply = QMessageBox.question(
-            self, '确认删除',
-            f"确定要删除以下内容吗？\n\n"
-            f"ID: {item_id}\n\n"
-            f"这将删除：\n"
-            f"• JSON 中的条目\n"
-            f"• visual_prompt 图片\n"
-            f"• training_mask 图片",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
+        # 删除文件
+        for key in ['visual_prompt_path', 'training_mask_path', 'mask_path']:
+            path = item.get(key, '')
+            if path and Path(path).exists():
+                try:
+                    os.remove(path)
+                    print(f"已删除: {path}")
+                except:
+                    pass
 
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-
-        # 删除 visual_prompt 文件
-        visual_path = item.get('visual_prompt_path', '')
-        if visual_path and Path(visual_path).exists():
-            try:
-                os.remove(visual_path)
-                print(f"已删除: {visual_path}")
-            except Exception as e:
-                print(f"删除失败: {e}")
-
-        # 删除 mask 文件
-        mask_path = item.get('training_mask_path', '')
-        if mask_path and Path(mask_path).exists():
-            try:
-                os.remove(mask_path)
-                print(f"已删除: {mask_path}")
-            except Exception as e:
-                print(f"删除失败: {e}")
-
-        # 从数据列表移除
+        # 移除数据
         self.json_data.pop(self.json_current_index)
         self.file_list_widget.takeItem(self.json_current_index)
         self.stats_label.setText(f"共 {len(self.json_data)} 条数据")
 
         # 选中下一条
         if len(self.json_data) > 0:
-            new_index = min(self.json_current_index, len(self.json_data) - 1)
-            self.file_list_widget.setCurrentRow(new_index)
+            new_idx = min(self.json_current_index, len(self.json_data) - 1)
+            self.file_list_widget.setCurrentRow(new_idx)
         else:
-            self.json_current_index = -1
-            self.canvas.set_image(None)
-            self.canvas.set_mask(None)
-            self.meta_text.clear()
-            self.text_editor.clear()
+            self.on_mode_changed()  # 清空显示
 
     # ==========================
-    # 保存操作
-    # ==========================
-
-    def save_current(self):
-        """保存当前修改"""
-        if self.current_mode == "folder":
-            self._save_folder_item()
-        else:
-            self._save_json_item()
-
-    def _save_folder_item(self):
-        """保存文件夹模式下的标注"""
-        if self.current_image is None:
-            return
-
-        text_content = self.text_editor.toPlainText()
-
-        if self.current_mask is not None:
-            self.data_manager.save_annotation(self.current_mask, text_content)
-            print("已保存")
-        else:
-            print("没有 mask 可保存")
-
-        # 跳转下一张
-        next_row = self.file_list_widget.currentRow() + 1
-        if next_row < self.file_list_widget.count():
-            self.file_list_widget.setCurrentRow(next_row)
-        else:
-            QMessageBox.information(self, "完成", "所有图片已处理完毕！")
-
-    def _save_json_item(self):
-        """保存 JSON 模式下的修改"""
-        if not self.json_path:
-            QMessageBox.warning(self, "警告", "没有加载 JSON 文件")
-            return
-
-        # 保存当前 mask 到文件
-        if self.json_current_index >= 0 and self.current_mask is not None:
-            item = self.json_data[self.json_current_index]
-            mask_path = item.get('training_mask_path', '')
-            if mask_path:
-                mask_to_save = (self.current_mask * 255).astype(np.uint8)
-                cv2.imwrite(mask_path, mask_to_save)
-                print(f"Mask 已保存: {mask_path}")
-
-        # 保存 JSON 文件
-        try:
-            with open(self.json_path, 'w', encoding='utf-8') as f:
-                json.dump(self.json_data, f, ensure_ascii=False, indent=4)
-            QMessageBox.information(self, "成功", f"已保存到:\n{self.json_path}")
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f"保存失败: {e}")
-
-    # ==========================
-    # 导航
+    # 辅助功能与导航
     # ==========================
 
     def navigate_prev(self):
-        """上一条"""
-        current_row = self.file_list_widget.currentRow()
-        if current_row > 0:
-            self.file_list_widget.setCurrentRow(current_row - 1)
+        """上一条 (自动保存文本)"""
+        row = self.file_list_widget.currentRow()
+        if row > 0:
+            self._auto_save_current()
+            self.file_list_widget.setCurrentRow(row - 1)
 
     def navigate_next(self):
-        """下一条"""
-        current_row = self.file_list_widget.currentRow()
-        if current_row < self.file_list_widget.count() - 1:
+        """下一条 (自动保存文本)"""
+        row = self.file_list_widget.currentRow()
+        if row < self.file_list_widget.count() - 1:
             self._auto_save_current()
-            self.file_list_widget.setCurrentRow(current_row + 1)
+            self.file_list_widget.setCurrentRow(row + 1)
+
+    def _auto_save_current(self):
+        """
+        静默自动保存 - 仅限保存文本
+        在 JSON 模式下，绝不覆盖 mask 文件，防止误操作。
+        """
+        if self.current_mode == "folder":
+            self._save_folder_item()
+        else:
+            # 简化版自动保存，不弹窗，且只存文本
+            if not self.json_path or self.json_current_index < 0: return
+
+            item = self.json_data[self.json_current_index]
+
+            # 1. 仅更新文本
+            text = self.text_editor.toPlainText()
+            convs = self._parse_conversations(text)
+            if convs:
+                item['conversations'] = convs
+
+            # 2. 写入 JSON 文件 (不保存 Mask)
+            try:
+                with open(self.json_path, 'w', encoding='utf-8') as f:
+                    json.dump(self.json_data, f, ensure_ascii=False, indent=4)
+                print(f"文本已自动保存至 JSON: {self.json_path}")
+            except Exception as e:
+                print(f"自动保存文本失败: {e}")
 
     def translate_text(self):
-        """翻译当前对话文本"""
         text = self.text_editor.toPlainText().strip()
-        if not text:
-            QMessageBox.warning(self, "警告", "没有可翻译的文本")
-            return
-
+        if not text: return
         self.btn_translate.setEnabled(False)
         self.btn_translate.setText("翻译中...")
-
         try:
-            # 移除特殊标记后翻译
-            clean_text = text.replace('<image>\n', '').replace('[SEG]', '[分割]')
-            translated = self.translator.translate(clean_text, from_lang='en', to_lang='zh')
-            self.translated_text.setPlainText(translated)
-        except Exception as e:
-            QMessageBox.warning(self, "翻译失败", str(e))
+            self._auto_translate(text)
         finally:
             self.btn_translate.setEnabled(True)
             self.btn_translate.setText("🌐 翻译为中文")
 
     def _auto_translate(self, text: str):
-        """自动翻译文本"""
         if not text.strip():
             self.translated_text.clear()
             return
-
         try:
             clean_text = text.replace('<image>\n', '').replace('[SEG]', '[分割]')
             translated = self.translator.translate(clean_text, from_lang='en', to_lang='zh')
             self.translated_text.setPlainText(translated)
         except Exception as e:
             self.translated_text.setPlainText(f"翻译失败: {e}")
-
-    def _save_json_item(self):
-        """保存 JSON 模式下的修改"""
-        if not self.json_path:
-            QMessageBox.warning(self, "警告", "没有加载 JSON 文件")
-            return
-
-        if self.json_current_index < 0 or self.json_current_index >= len(self.json_data):
-            return
-
-        item = self.json_data[self.json_current_index]
-
-        # 1. 解析编辑器中的对话内容并更新 JSON
-        text_content = self.text_editor.toPlainText()
-        new_conversations = self._parse_conversations(text_content)
-        if new_conversations:
-            item['conversations'] = new_conversations
-
-        # 2. 保存当前 mask 到文件
-        if self.current_mask is not None:
-            mask_path = item.get('mask_path', '') or item.get('training_mask_path', '')
-            if mask_path:
-                mask_to_save = (self.current_mask * 255).astype(np.uint8)
-                cv2.imwrite(mask_path, mask_to_save)
-                print(f"Mask 已保存: {mask_path}")
-
-        # 3. 保存 JSON 文件
-        try:
-            with open(self.json_path, 'w', encoding='utf-8') as f:
-                json.dump(self.json_data, f, ensure_ascii=False, indent=4)
-            QMessageBox.information(self, "成功", f"已保存到:\n{self.json_path}")
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f"保存失败: {e}")
-
-    def _parse_conversations(self, text: str) -> list:
-        """将编辑器文本解析回 conversations 格式"""
-        if not text.strip():
-            return []
-
-        conversations = []
-        # 按角色标记分割
-        parts = text.split('👤 Human:')
-
-        for part in parts:
-            if not part.strip():
-                continue
-
-            # 检查是否包含 GPT 回复
-            if '🤖 GPT:' in part:
-                human_gpt = part.split('🤖 GPT:')
-                human_text = human_gpt[0].strip()
-                gpt_text = human_gpt[1].strip() if len(human_gpt) > 1 else ''
-
-                if human_text:
-                    conversations.append({
-                        'from': 'human',
-                        'value': human_text
-                    })
-                if gpt_text:
-                    conversations.append({
-                        'from': 'gpt',
-                        'value': gpt_text
-                    })
-            else:
-                # 只有 human 部分
-                human_text = part.strip()
-                if human_text:
-                    conversations.append({
-                        'from': 'human',
-                        'value': human_text
-                    })
-
-        return conversations
-
-    def _auto_save_current(self):
-        """静默自动保存（不弹窗提示）"""
-        if self.current_mode == "folder":
-            self._auto_save_folder_item()
-        else:
-            self._auto_save_json_item()
-
-    def _auto_save_folder_item(self):
-        """自动保存文件夹模式"""
-        if self.current_image is None or self.current_mask is None:
-            return
-        text_content = self.text_editor.toPlainText()
-        self.data_manager.save_annotation(self.current_mask, text_content)
-        print("已自动保存")
-
-    def _auto_save_json_item(self):
-        """自动保存 JSON 模式（无弹窗）"""
-        if not self.json_path or self.json_current_index < 0:
-            return
-
-        item = self.json_data[self.json_current_index]
-
-        # 1. 解析对话内容
-        text_content = self.text_editor.toPlainText()
-        new_conversations = self._parse_conversations(text_content)
-        if new_conversations:
-            item['conversations'] = new_conversations
-
-        # 2. 保存 Mask
-        if self.current_mask is not None:
-            mask_path = item.get('mask_path', '') or item.get('training_mask_path', '')
-            if mask_path:
-                mask_to_save = (self.current_mask * 255).astype(np.uint8)
-                cv2.imwrite(mask_path, mask_to_save)
-
-        # 3. 保存 JSON
-        try:
-            with open(self.json_path, 'w', encoding='utf-8') as f:
-                json.dump(self.json_data, f, ensure_ascii=False, indent=4)
-            print(f"已自动保存: {self.json_path}")
-        except Exception as e:
-            print(f"自动保存失败: {e}")
