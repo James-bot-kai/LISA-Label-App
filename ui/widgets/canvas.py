@@ -1,7 +1,7 @@
 import numpy as np
 import cv2
 from PyQt6.QtWidgets import QWidget
-from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QCursor
+from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QPolygon
 from PyQt6.QtCore import pyqtSignal, Qt, QPoint, QRect
 
 
@@ -9,15 +9,17 @@ class InteractiveCanvas(QWidget):
     # 信号定义
     click_signal = pyqtSignal(int, int, int)  # SAM点击: x, y, is_left
     rect_erase_signal = pyqtSignal(int, int, int, int)  # 框选擦除: x, y, w, h
-    brush_signal = pyqtSignal(int, int, int)  # 画笔: x, y, is_add (1=add, 0=sub)
+    brush_signal = pyqtSignal(int, int, int)  # 画笔点涂: x, y, is_add
+    # 【新增】多边形/套索填充信号: 发送点的列表 [(x1,y1), (x2,y2), ...]
+    polygon_signal = pyqtSignal(list)
 
     def __init__(self, parent=None):
         super().__init__(parent)
 
         # --- 数据层 ---
         self.pixmap_image = None
-        self.pixmap_base = None  # 红色底图
-        self.pixmap_preview = None  # 绿色预览
+        self.pixmap_base = None
+        self.pixmap_preview = None
         self._image_w = 0
         self._image_h = 0
 
@@ -27,15 +29,16 @@ class InteractiveCanvas(QWidget):
         self.offset_y = 0.0
 
         # --- 交互状态 ---
-        self.mode = "sam"  # 模式: "sam", "eraser" (框选), "brush" (画笔)
-        self.brush_size = 10  # 画笔半径
-
+        self.mode = "sam"  # 模式: "sam", "eraser", "brush", "polygon"(新)
         self.is_panning = False
-        self.is_drawing_rect = False  # 是否正在拉框
-        self.is_brushing = False  # 是否正在涂抹
-        self.last_mouse_pos = QPoint()
+        self.is_drawing_rect = False
+        self.is_brushing = False
 
-        # 框选时的临时矩形 (屏幕坐标)
+        # 【新增】多边形绘制状态
+        self.is_drawing_polygon = False
+        self.polygon_points = []  # 存储绘制过程中的图像坐标点 (img_x, img_y)
+
+        self.last_mouse_pos = QPoint()
         self.drag_start_pos = QPoint()
         self.drag_current_pos = QPoint()
 
@@ -46,13 +49,21 @@ class InteractiveCanvas(QWidget):
     # API
     # ==========================
     def set_mode(self, mode):
-        """切换模式: 'sam', 'eraser', 'brush'"""
+        """切换模式"""
         self.mode = mode
+        # 重置所有交互状态
+        self.is_drawing_rect = False
+        self.is_brushing = False
+        self.is_drawing_polygon = False
+        self.polygon_points = []
+
+        # 设置光标
         if mode == "sam":
             self.setCursor(Qt.CursorShape.ArrowCursor)
         elif mode == "eraser":
             self.setCursor(Qt.CursorShape.CrossCursor)
-        elif mode == "brush":
+        elif mode in ["brush", "polygon"]:
+            # 画笔和套索都用手型光标，或者你可以自定义
             self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.update()
 
@@ -101,40 +112,48 @@ class InteractiveCanvas(QWidget):
             QImage(mask_rgba.data, self._image_w, self._image_h, self._image_w * 4, QImage.Format.Format_RGBA8888))
 
     # ==========================
-    # 绘图事件
+    # 绘图事件 (Paint Event)
     # ==========================
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
 
         if self.pixmap_image:
+            # 应用视图变换 (平移和缩放)
             painter.translate(self.offset_x, self.offset_y)
             painter.scale(self.scale, self.scale)
 
+            # 1. 画底图层
             painter.drawPixmap(0, 0, self.pixmap_image)
             if self.pixmap_base: painter.drawPixmap(0, 0, self.pixmap_base)
             if self.pixmap_preview: painter.drawPixmap(0, 0, self.pixmap_preview)
 
-            # 绘制交互元素 (框选时的红框)
+            # 2. 画交互元素 (不受缩放影响的线宽需要反向计算)
+
+            # 框选橡皮擦的预览框
             if self.mode == "eraser" and self.is_drawing_rect:
-                # 逆变换回 图像坐标系 绘制? 不，直接在屏幕坐标系绘制更方便
-                # 但由于 painter 已经 translate/scale 了，我们在这里画图就是画在图像上的
-                # 转换屏幕坐标 -> 图像坐标
+                # 将屏幕坐标转回图像坐标
                 x1 = (self.drag_start_pos.x() - self.offset_x) / self.scale
                 y1 = (self.drag_start_pos.y() - self.offset_y) / self.scale
                 x2 = (self.drag_current_pos.x() - self.offset_x) / self.scale
                 y2 = (self.drag_current_pos.y() - self.offset_y) / self.scale
 
-                pen = QPen(QColor(255, 255, 0), 2 / self.scale)  # 黄色框
+                pen = QPen(QColor(255, 255, 0), 2 / self.scale)  # 黄色虚线，线宽随缩放调整
                 pen.setStyle(Qt.PenStyle.DashLine)
                 painter.setPen(pen)
                 painter.setBrush(Qt.BrushStyle.NoBrush)
+                # 在图像坐标系上画矩形
                 painter.drawRect(QRect(QPoint(int(x1), int(y1)), QPoint(int(x2), int(y2))))
 
-            # 绘制画笔光标 (可选)
-            if self.mode == "brush":
-                # 这里略过光标绘制，直接用鼠标点击效果
-                pass
+            # 【新增】多边形/套索的预览轨迹
+            if self.mode == "polygon" and self.is_drawing_polygon and len(self.polygon_points) > 1:
+                pen = QPen(QColor(0, 255, 255), 2 / self.scale)  # 青色实线
+                painter.setPen(pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+
+                # 将记录的图像坐标点转换为 QPolygon 进行绘制
+                qpoints = [QPoint(p[0], p[1]) for p in self.polygon_points]
+                painter.drawPolyline(QPolygon(qpoints))
 
         else:
             painter.setPen(QColor(150, 150, 150))
@@ -146,37 +165,38 @@ class InteractiveCanvas(QWidget):
     def mousePressEvent(self, event):
         if not self.pixmap_image: return
 
-        # 中键平移 (优先级最高)
         if event.button() == Qt.MouseButton.MiddleButton:
             self.is_panning = True
             self.last_mouse_pos = event.position()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             return
 
-        # 坐标映射
+        # 计算图像坐标
         widget_pos = event.position()
         img_x = int((widget_pos.x() - self.offset_x) / self.scale)
         img_y = int((widget_pos.y() - self.offset_y) / self.scale)
 
-        # 越界检查
-        if not (0 <= img_x < self._image_w and 0 <= img_y < self._image_h):
-            return
+        is_inside = (0 <= img_x < self._image_w and 0 <= img_y < self._image_h)
 
         # === 模式分发 ===
-        if self.mode == "sam":
+        if self.mode == "sam" and is_inside:
             is_left = 1 if event.button() == Qt.MouseButton.LeftButton else 0
             self.click_signal.emit(img_x, img_y, is_left)
 
-        elif self.mode == "eraser":
-            if event.button() == Qt.MouseButton.LeftButton:
-                self.is_drawing_rect = True
-                self.drag_start_pos = widget_pos
-                self.drag_current_pos = widget_pos
+        elif self.mode == "eraser" and event.button() == Qt.MouseButton.LeftButton:
+            self.is_drawing_rect = True
+            self.drag_start_pos = widget_pos
+            self.drag_current_pos = widget_pos
 
-        elif self.mode == "brush":
+        elif self.mode == "brush" and is_inside:
             self.is_brushing = True
             is_add = 1 if event.button() == Qt.MouseButton.LeftButton else 0
             self.brush_signal.emit(img_x, img_y, is_add)
+
+        # 【新增】多边形模式开始绘制
+        elif self.mode == "polygon" and event.button() == Qt.MouseButton.LeftButton and is_inside:
+            self.is_drawing_polygon = True
+            self.polygon_points = [(img_x, img_y)]  # 记录起点
 
     def mouseMoveEvent(self, event):
         if self.is_panning:
@@ -188,24 +208,30 @@ class InteractiveCanvas(QWidget):
             return
 
         widget_pos = event.position()
+        img_x = int((widget_pos.x() - self.offset_x) / self.scale)
+        img_y = int((widget_pos.y() - self.offset_y) / self.scale)
+        is_inside = (0 <= img_x < self._image_w and 0 <= img_y < self._image_h)
 
         if self.mode == "eraser" and self.is_drawing_rect:
             self.drag_current_pos = widget_pos
-            self.update()  # 触发重绘以显示框
+            self.update()  # 重绘以更新预览框
 
-        elif self.mode == "brush" and self.is_brushing:
-            img_x = int((widget_pos.x() - self.offset_x) / self.scale)
-            img_y = int((widget_pos.y() - self.offset_y) / self.scale)
-            # 只有在移动到新位置且在图内时才发射信号
-            if 0 <= img_x < self._image_w and 0 <= img_y < self._image_h:
-                is_add = 1 if event.buttons() & Qt.MouseButton.LeftButton else 0
-                self.brush_signal.emit(img_x, img_y, is_add)
+        elif self.mode == "brush" and self.is_brushing and is_inside:
+            is_add = 1 if event.buttons() & Qt.MouseButton.LeftButton else 0
+            self.brush_signal.emit(img_x, img_y, is_add)
+
+        # 【新增】多边形模式：记录轨迹点
+        elif self.mode == "polygon" and self.is_drawing_polygon and is_inside:
+            # 避免记录过于密集的点，可以加一个简单的距离判断，这里暂且直接添加
+            self.polygon_points.append((img_x, img_y))
+            self.update()  # 重绘以更新预览线
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.MiddleButton:
             self.is_panning = False
-            self.setCursor(Qt.CursorShape.ArrowCursor if self.mode == "sam" else
-                           (Qt.CursorShape.CrossCursor if self.mode == "eraser" else Qt.CursorShape.PointingHandCursor))
+            # 恢复对应模式的光标
+            cursor_map = {"sam": Qt.CursorShape.ArrowCursor, "eraser": Qt.CursorShape.CrossCursor}
+            self.setCursor(cursor_map.get(self.mode, Qt.CursorShape.PointingHandCursor))
             return
 
         if self.mode == "eraser" and self.is_drawing_rect:
@@ -221,10 +247,20 @@ class InteractiveCanvas(QWidget):
             h = y2 - y1
             if w > 0 and h > 0:
                 self.rect_erase_signal.emit(x1, y1, w, h)
-            self.update()  # 清除黄框
+            self.update()
 
         elif self.mode == "brush":
             self.is_brushing = False
+
+        # 【新增】多边形模式结束绘制
+        elif self.mode == "polygon" and self.is_drawing_polygon:
+            self.is_drawing_polygon = False
+            # 只有点数足够构成多边形才发送信号
+            if len(self.polygon_points) > 2:
+                self.polygon_signal.emit(self.polygon_points)
+            # 清空轨迹
+            self.polygon_points = []
+            self.update()
 
     def wheelEvent(self, event):
         if not self.pixmap_image: return
