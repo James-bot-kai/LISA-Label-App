@@ -5,7 +5,7 @@ import numpy as np
 from PyQt6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout, QWidget,
                              QFileDialog, QListWidget, QPushButton, QTextEdit,
                              QLabel, QSplitter, QMessageBox, QFrame, QGroupBox,
-                             QRadioButton)
+                             QRadioButton, QButtonGroup)
 from PyQt6.QtCore import pyqtSlot, Qt
 from pathlib import Path
 
@@ -54,6 +54,8 @@ class MainWindow(QMainWindow):
         # 3. 信号连接
         self.canvas.click_signal.connect(self.handle_canvas_click)
         self.file_list_widget.currentRowChanged.connect(self.on_file_selected)
+        self.canvas.rect_erase_signal.connect(self.handle_rect_erase)
+        self.canvas.brush_signal.connect(self.handle_brush_paint)
 
     def init_ui(self):
         """初始化界面布局"""
@@ -127,6 +129,38 @@ class MainWindow(QMainWindow):
         )
         info_label.setTextFormat(Qt.TextFormat.RichText)
         right_layout.addWidget(info_label)
+
+        # === 【修改】工具模式切换按钮组 ===
+        tools_group = QGroupBox("工具箱")
+        tools_layout = QHBoxLayout(tools_group)
+
+        # 1. SAM 模式按钮
+        self.btn_tool_sam = QPushButton("🎯 SAM (点选)")
+        self.btn_tool_sam.setCheckable(True)
+        self.btn_tool_sam.setChecked(True)  # 默认选中
+        self.btn_tool_sam.clicked.connect(lambda: self.switch_tool("sam"))
+
+        # 2. 框选擦除按钮
+        self.btn_tool_erase = QPushButton("🔲 框选擦除")
+        self.btn_tool_erase.setCheckable(True)
+        self.btn_tool_erase.clicked.connect(lambda: self.switch_tool("eraser"))
+
+        # 3. 画笔工具按钮
+        self.btn_tool_brush = QPushButton("🖌️ 画笔微调")
+        self.btn_tool_brush.setCheckable(True)
+        self.btn_tool_brush.clicked.connect(lambda: self.switch_tool("brush"))
+
+        # 互斥按钮组
+        self.tool_btn_group = QButtonGroup()
+        self.tool_btn_group.addButton(self.btn_tool_sam)
+        self.tool_btn_group.addButton(self.btn_tool_erase)
+        self.tool_btn_group.addButton(self.btn_tool_brush)
+        self.tool_btn_group.setExclusive(True)
+
+        tools_layout.addWidget(self.btn_tool_sam)
+        tools_layout.addWidget(self.btn_tool_erase)
+        tools_layout.addWidget(self.btn_tool_brush)
+        right_layout.addWidget(tools_group)
 
         # SAM 重置按钮
         self.btn_reset_mask = QPushButton("↺ 取消当前 SAM 预览")
@@ -685,3 +719,77 @@ class MainWindow(QMainWindow):
             self.translated_text.setPlainText(translated)
         except Exception as e:
             self.translated_text.setPlainText(f"翻译失败: {e}")
+
+    # ==========================
+    # 工具切换逻辑
+    # ==========================
+    def switch_tool(self, mode):
+        """切换画布模式"""
+        self.canvas.set_mode(mode)
+        # 提示用户
+        if mode == "eraser":
+            self.text_editor.setPlaceholderText("擦除模式：拉框选中区域，该区域内的 Mask 将被清除。")
+        elif mode == "brush":
+            self.text_editor.setPlaceholderText("画笔模式：左键涂抹=添加，右键涂抹=擦除。")
+        else:
+            self.text_editor.setPlaceholderText("SAM模式：左键=前景点，右键=背景点。")
+
+    # ==========================
+    # 画笔功能实现
+    # ==========================
+
+    @pyqtSlot(int, int, int, int)
+    def handle_rect_erase(self, x, y, w, h):
+        """
+        处理框选擦除：同时擦除 Base Mask (红) 和 SAM Mask (绿)
+        """
+        if self.base_mask is None: return
+
+        # 1. 计算坐标边界
+        img_h, img_w = self.base_mask.shape[:2]
+        x1 = max(0, x)
+        y1 = max(0, y)
+        x2 = min(img_w, x + w)
+        y2 = min(img_h, y + h)
+
+        if x2 > x1 and y2 > y1:
+            # 2. 擦除红色底图 (Base Mask)
+            self.base_mask[y1:y2, x1:x2] = 0
+
+            # 3. 【新增】如果有绿色预览 (SAM Mask)，也一起擦除
+            # 这样你就能把 SAM 多选出来的部分“切掉”
+            if self.sam_mask is not None:
+                # 确保尺寸一致防止报错
+                if self.sam_mask.shape == self.base_mask.shape:
+                    self.sam_mask[y1:y2, x1:x2] = 0
+
+            print(f"区域擦除: [{x1}:{x2}, {y1}:{y2}]")
+            self.update_canvas_display()
+
+    @pyqtSlot(int, int, int)
+    def handle_brush_paint(self, x, y, is_add):
+        """
+        处理画笔涂抹
+        is_add: 1 (左键/增加), 0 (右键/擦除)
+        """
+        if self.base_mask is None:
+            if self.current_image is not None:
+                h, w = self.current_image.shape[:2]
+                self.base_mask = np.zeros((h, w), dtype=np.uint8)
+            else:
+                return
+
+        radius = 10  # 画笔大小
+
+        # 1. 操作红色底图 (Base Mask)
+        # 左键画红(1)，右键擦除(0)
+        color = 1 if is_add else 0
+        cv2.circle(self.base_mask, (x, y), radius, color, -1)
+
+        # 2. 【新增】如果是右键擦除 (is_add=0)，同时也擦除绿色预览
+        # 这样你可以用右键修整 SAM 的边缘
+        if not is_add and self.sam_mask is not None:
+            if self.sam_mask.shape == self.base_mask.shape:
+                cv2.circle(self.sam_mask, (x, y), radius, 0, -1)
+
+        self.update_canvas_display()

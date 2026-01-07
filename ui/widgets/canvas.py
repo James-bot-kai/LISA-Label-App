@@ -1,131 +1,108 @@
 import numpy as np
 import cv2
 from PyQt6.QtWidgets import QWidget
-from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QBrush
-from PyQt6.QtCore import pyqtSignal, Qt, QPoint, QRectF
+from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QCursor
+from PyQt6.QtCore import pyqtSignal, Qt, QPoint, QRect
 
 
 class InteractiveCanvas(QWidget):
-    """
-    一个支持缩放、平移、双层 Mask (Base + Preview) 叠加显示的自定义画布控件。
-    """
-
-    # 信号：发射 (image_x, image_y, is_left_click)
-    # is_left_click: 1 for Left (Add point), 0 for Right (Remove point)
-    click_signal = pyqtSignal(int, int, int)
+    # 信号定义
+    click_signal = pyqtSignal(int, int, int)  # SAM点击: x, y, is_left
+    rect_erase_signal = pyqtSignal(int, int, int, int)  # 框选擦除: x, y, w, h
+    brush_signal = pyqtSignal(int, int, int)  # 画笔: x, y, is_add (1=add, 0=sub)
 
     def __init__(self, parent=None):
         super().__init__(parent)
 
         # --- 数据层 ---
-        self.pixmap_image = None  # 底层原图
-        self.pixmap_base = None  # 中层: 已确认的 Mask (红色)
-        self.pixmap_preview = None  # 顶层: SAM 正在预测的 Mask (绿色)
-
+        self.pixmap_image = None
+        self.pixmap_base = None  # 红色底图
+        self.pixmap_preview = None  # 绿色预览
         self._image_w = 0
         self._image_h = 0
 
-        # --- 视图变换层 ---
+        # --- 视图变换 ---
         self.scale = 1.0
         self.offset_x = 0.0
         self.offset_y = 0.0
 
         # --- 交互状态 ---
+        self.mode = "sam"  # 模式: "sam", "eraser" (框选), "brush" (画笔)
+        self.brush_size = 10  # 画笔半径
+
         self.is_panning = False
+        self.is_drawing_rect = False  # 是否正在拉框
+        self.is_brushing = False  # 是否正在涂抹
         self.last_mouse_pos = QPoint()
 
-        # --- 样式配置 ---
+        # 框选时的临时矩形 (屏幕坐标)
+        self.drag_start_pos = QPoint()
+        self.drag_current_pos = QPoint()
+
         self.setMouseTracking(True)
         self.setStyleSheet("background-color: #2b2b2b;")
 
-    # ============================
-    # 1. 数据加载接口
-    # ============================
+    # ==========================
+    # API
+    # ==========================
+    def set_mode(self, mode):
+        """切换模式: 'sam', 'eraser', 'brush'"""
+        self.mode = mode
+        if mode == "sam":
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        elif mode == "eraser":
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        elif mode == "brush":
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.update()
 
     def set_image(self, img_np):
-        """加载 OpenCV 图片"""
         if img_np is None:
             self.pixmap_image = None
             self.update()
             return
 
-        # 1. 格式转换: BGR -> RGB
         if len(img_np.shape) == 3:
             img_rgb = cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB)
             h, w, ch = img_rgb.shape
-            bytes_per_line = ch * w
-            format_ = QImage.Format.Format_RGB888
+            fmt = QImage.Format.Format_RGB888
         else:
             img_rgb = img_np
             h, w = img_rgb.shape
-            bytes_per_line = w
-            format_ = QImage.Format.Format_Grayscale8
+            ch = 1;
+            fmt = QImage.Format.Format_Grayscale8
 
         self._image_w = w
         self._image_h = h
-
-        # 2. 创建 QPixmap
-        q_img = QImage(img_rgb.data, w, h, bytes_per_line, format_)
+        q_img = QImage(img_rgb.data, w, h, w * (3 if ch == 3 else 1), fmt)
         self.pixmap_image = QPixmap.fromImage(q_img)
 
-        # 3. 换图时，必须重置所有 Mask
         self.pixmap_base = None
         self.pixmap_preview = None
-
         self.fit_to_window()
         self.update()
 
-    def _make_colored_mask(self, mask_np, color_rgb):
-        """
-        [内部辅助] 将 0/1 Mask 转换为带颜色的透明 QPixmap
-        color_rgb: tuple (R, G, B) 例如 (255, 0, 0)
-        """
-        if mask_np is None:
-            return None
-
-        # 尺寸对齐 (防止计算误差导致尺寸不匹配)
-        if mask_np.shape[:2] != (self._image_h, self._image_w):
-            mask_np = cv2.resize(mask_np, (self._image_w, self._image_h), interpolation=cv2.INTER_NEAREST)
-
-        # 1. 初始化 RGBA 矩阵
-        mask_rgba = np.zeros((self._image_h, self._image_w, 4), dtype=np.uint8)
-
-        # 2. 找到前景区域
-        foreground = (mask_np > 0)
-
-        # 3. 填充颜色
-        mask_rgba[foreground, 0] = color_rgb[0]  # R
-        mask_rgba[foreground, 1] = color_rgb[1]  # G
-        mask_rgba[foreground, 2] = color_rgb[2]  # B
-        mask_rgba[foreground, 3] = 120  # Alpha (透明度)
-
-        # 4. 转 QPixmap
-        q_img = QImage(mask_rgba.data, self._image_w, self._image_h,
-                       self._image_w * 4, QImage.Format.Format_RGBA8888)
-        return QPixmap.fromImage(q_img)
-
     def set_mask(self, mask_np):
-        """设置底图 Mask (显示为红色)"""
-        # 如果传入 None，清除底图
-        if mask_np is None:
-            self.pixmap_base = None
-        else:
-            self.pixmap_base = self._make_colored_mask(mask_np, (255, 0, 0))  # Red
+        self.pixmap_base = self._make_colored_mask(mask_np, (255, 0, 0))
         self.update()
 
     def set_preview_mask(self, mask_np):
-        """【新】设置预览 Mask (显示为绿色)"""
-        # 如果传入 None，清除预览
-        if mask_np is None:
-            self.pixmap_preview = None
-        else:
-            self.pixmap_preview = self._make_colored_mask(mask_np, (0, 255, 0))  # Green
+        self.pixmap_preview = self._make_colored_mask(mask_np, (0, 255, 0))
         self.update()
 
-    # ============================
-    # 2. 核心绘图逻辑
-    # ============================
+    def _make_colored_mask(self, mask_np, color):
+        if mask_np is None: return None
+        if mask_np.shape[:2] != (self._image_h, self._image_w):
+            mask_np = cv2.resize(mask_np, (self._image_w, self._image_h), interpolation=cv2.INTER_NEAREST)
 
+        mask_rgba = np.zeros((self._image_h, self._image_w, 4), dtype=np.uint8)
+        mask_rgba[mask_np > 0] = [color[0], color[1], color[2], 120]
+        return QPixmap.fromImage(
+            QImage(mask_rgba.data, self._image_w, self._image_h, self._image_w * 4, QImage.Format.Format_RGBA8888))
+
+    # ==========================
+    # 绘图事件
+    # ==========================
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
@@ -134,64 +111,72 @@ class InteractiveCanvas(QWidget):
             painter.translate(self.offset_x, self.offset_y)
             painter.scale(self.scale, self.scale)
 
-            # 1. 画原图
             painter.drawPixmap(0, 0, self.pixmap_image)
+            if self.pixmap_base: painter.drawPixmap(0, 0, self.pixmap_base)
+            if self.pixmap_preview: painter.drawPixmap(0, 0, self.pixmap_preview)
 
-            # 2. 画红色底图 (Base)
-            if self.pixmap_base:
-                painter.drawPixmap(0, 0, self.pixmap_base)
+            # 绘制交互元素 (框选时的红框)
+            if self.mode == "eraser" and self.is_drawing_rect:
+                # 逆变换回 图像坐标系 绘制? 不，直接在屏幕坐标系绘制更方便
+                # 但由于 painter 已经 translate/scale 了，我们在这里画图就是画在图像上的
+                # 转换屏幕坐标 -> 图像坐标
+                x1 = (self.drag_start_pos.x() - self.offset_x) / self.scale
+                y1 = (self.drag_start_pos.y() - self.offset_y) / self.scale
+                x2 = (self.drag_current_pos.x() - self.offset_x) / self.scale
+                y2 = (self.drag_current_pos.y() - self.offset_y) / self.scale
 
-            # 3. 画绿色预览 (Preview) - 这一层在最上面
-            if self.pixmap_preview:
-                painter.drawPixmap(0, 0, self.pixmap_preview)
+                pen = QPen(QColor(255, 255, 0), 2 / self.scale)  # 黄色框
+                pen.setStyle(Qt.PenStyle.DashLine)
+                painter.setPen(pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRect(QRect(QPoint(int(x1), int(y1)), QPoint(int(x2), int(y2))))
+
+            # 绘制画笔光标 (可选)
+            if self.mode == "brush":
+                # 这里略过光标绘制，直接用鼠标点击效果
+                pass
 
         else:
             painter.setPen(QColor(150, 150, 150))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No Image Loaded")
 
-    # ============================
-    # 3. 交互逻辑 (保持不变)
-    # ============================
-
-    def wheelEvent(self, event):
-        if not self.pixmap_image: return
-        zoom_in_factor = 1.1
-        zoom_out_factor = 0.9
-
-        if event.angleDelta().y() > 0:
-            factor = zoom_in_factor
-        else:
-            factor = zoom_out_factor
-
-        mouse_pos = event.position()
-        old_x = (mouse_pos.x() - self.offset_x) / self.scale
-        old_y = (mouse_pos.y() - self.offset_y) / self.scale
-
-        self.scale *= factor
-        self.scale = max(0.05, min(self.scale, 50.0))
-
-        self.offset_x = mouse_pos.x() - old_x * self.scale
-        self.offset_y = mouse_pos.y() - old_y * self.scale
-        self.update()
-
+    # ==========================
+    # 鼠标交互逻辑
+    # ==========================
     def mousePressEvent(self, event):
         if not self.pixmap_image: return
 
+        # 中键平移 (优先级最高)
         if event.button() == Qt.MouseButton.MiddleButton:
             self.is_panning = True
             self.last_mouse_pos = event.position()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             return
 
-        widget_x = event.position().x()
-        widget_y = event.position().y()
-        img_x = int((widget_x - self.offset_x) / self.scale)
-        img_y = int((widget_y - self.offset_y) / self.scale)
+        # 坐标映射
+        widget_pos = event.position()
+        img_x = int((widget_pos.x() - self.offset_x) / self.scale)
+        img_y = int((widget_pos.y() - self.offset_y) / self.scale)
 
-        if 0 <= img_x < self._image_w and 0 <= img_y < self._image_h:
+        # 越界检查
+        if not (0 <= img_x < self._image_w and 0 <= img_y < self._image_h):
+            return
+
+        # === 模式分发 ===
+        if self.mode == "sam":
             is_left = 1 if event.button() == Qt.MouseButton.LeftButton else 0
-            print(f"[Canvas] Clicked: Image({img_x}, {img_y}), Type: {is_left}")
             self.click_signal.emit(img_x, img_y, is_left)
+
+        elif self.mode == "eraser":
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.is_drawing_rect = True
+                self.drag_start_pos = widget_pos
+                self.drag_current_pos = widget_pos
+
+        elif self.mode == "brush":
+            self.is_brushing = True
+            is_add = 1 if event.button() == Qt.MouseButton.LeftButton else 0
+            self.brush_signal.emit(img_x, img_y, is_add)
 
     def mouseMoveEvent(self, event):
         if self.is_panning:
@@ -200,20 +185,63 @@ class InteractiveCanvas(QWidget):
             self.offset_y += delta.y()
             self.last_mouse_pos = event.position()
             self.update()
+            return
+
+        widget_pos = event.position()
+
+        if self.mode == "eraser" and self.is_drawing_rect:
+            self.drag_current_pos = widget_pos
+            self.update()  # 触发重绘以显示框
+
+        elif self.mode == "brush" and self.is_brushing:
+            img_x = int((widget_pos.x() - self.offset_x) / self.scale)
+            img_y = int((widget_pos.y() - self.offset_y) / self.scale)
+            # 只有在移动到新位置且在图内时才发射信号
+            if 0 <= img_x < self._image_w and 0 <= img_y < self._image_h:
+                is_add = 1 if event.buttons() & Qt.MouseButton.LeftButton else 0
+                self.brush_signal.emit(img_x, img_y, is_add)
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.MiddleButton:
             self.is_panning = False
-            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.setCursor(Qt.CursorShape.ArrowCursor if self.mode == "sam" else
+                           (Qt.CursorShape.CrossCursor if self.mode == "eraser" else Qt.CursorShape.PointingHandCursor))
+            return
+
+        if self.mode == "eraser" and self.is_drawing_rect:
+            self.is_drawing_rect = False
+            # 计算最终框选区域 (图像坐标)
+            p1 = self.drag_start_pos
+            p2 = event.position()
+            x1 = int((min(p1.x(), p2.x()) - self.offset_x) / self.scale)
+            y1 = int((min(p1.y(), p2.y()) - self.offset_y) / self.scale)
+            x2 = int((max(p1.x(), p2.x()) - self.offset_x) / self.scale)
+            y2 = int((max(p1.y(), p2.y()) - self.offset_y) / self.scale)
+            w = x2 - x1
+            h = y2 - y1
+            if w > 0 and h > 0:
+                self.rect_erase_signal.emit(x1, y1, w, h)
+            self.update()  # 清除黄框
+
+        elif self.mode == "brush":
+            self.is_brushing = False
+
+    def wheelEvent(self, event):
+        if not self.pixmap_image: return
+        factor = 1.1 if event.angleDelta().y() > 0 else 0.9
+        mouse_pos = event.position()
+        old_x = (mouse_pos.x() - self.offset_x) / self.scale
+        old_y = (mouse_pos.y() - self.offset_y) / self.scale
+        self.scale = max(0.05, min(self.scale, 50.0)) * factor
+        self.offset_x = mouse_pos.x() - old_x * self.scale
+        self.offset_y = mouse_pos.y() - old_y * self.scale
+        self.update()
 
     def fit_to_window(self):
-        if not self.pixmap_image or self.width() == 0 or self.height() == 0:
-            return
+        if not self.pixmap_image: return
         scale_w = self.width() / self._image_w
         scale_h = self.height() / self._image_h
         self.scale = min(scale_w, scale_h) * 0.9
-        new_w = self._image_w * self.scale
-        new_h = self._image_h * self.scale
-        self.offset_x = (self.width() - new_w) / 2
-        self.offset_y = (self.height() - new_h) / 2
+        self.offset_x = (self.width() - self._image_w * self.scale) / 2
+        self.offset_y = (self.height() - self._image_h * self.scale) / 2
         self.update()
