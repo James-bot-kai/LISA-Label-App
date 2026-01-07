@@ -5,11 +5,12 @@ import numpy as np
 from PyQt6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout, QWidget,
                              QFileDialog, QListWidget, QPushButton, QTextEdit,
                              QLabel, QSplitter, QMessageBox, QFrame, QGroupBox,
-                             QRadioButton, QButtonGroup, QSlider, QSpinBox)
+                             QRadioButton, QButtonGroup, QSlider, QSpinBox,
+                             QGridLayout)  # <--- 新增 QGridLayout
 from PyQt6.QtCore import pyqtSlot, Qt
 from pathlib import Path
 
-# 确保引入的是修改后的 InteractiveCanvas
+# 确保引入的是修改过支持 set_preview_mask 的 Canvas
 from ui.widgets.canvas import InteractiveCanvas
 from core.sam_engine import SAMEngine
 from core.data_manager import DataManager
@@ -25,25 +26,25 @@ class MainWindow(QMainWindow):
 
         # 1. 初始化后端逻辑模块
         self.data_manager = DataManager()
-        # 请确保路径正确
+        # 请确保路径正确，且文件已下载
         self.sam_engine = SAMEngine(checkpoint_path="checkpoints/sam_vit_b_01ec64.pth")
 
         # --- 交互状态缓存 (State) ---
         self.current_image = None
-        self.base_mask = None  # 永久层：红色
-        self.sam_mask = None  # 临时层：绿色
+        self.base_mask = None  # 永久层：从文件加载或已合并的 Mask (显示为红色)
+        self.sam_mask = None  # 临时层：SAM 当前预测的 Mask (显示为绿色)
         self.input_points = []
         self.input_labels = []
         self.current_mask = None
 
         # --- 画笔设置 ---
-        self.brush_radius = 10
+        self.brush_radius = 10  # 默认画笔半径
 
         # --- JSON 数据模式状态 ---
         self.json_data = []
         self.json_path = None
         self.json_current_index = -1
-        self.current_mode = "folder"
+        self.current_mode = "folder"  # "folder" 或 "json"
 
         # 翻译器初始化
         self.translator = BaiduTranslator(
@@ -59,7 +60,6 @@ class MainWindow(QMainWindow):
         self.file_list_widget.currentRowChanged.connect(self.on_file_selected)
         self.canvas.rect_erase_signal.connect(self.handle_rect_erase)
         self.canvas.brush_signal.connect(self.handle_brush_paint)
-        # 【新增】连接多边形填充信号
         self.canvas.polygon_signal.connect(self.handle_polygon_fill)
 
     def init_ui(self):
@@ -71,11 +71,11 @@ class MainWindow(QMainWindow):
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # === 左侧面板 ===
+        # === 左侧面板：文件导航 ===
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
 
-        # 模式切换
+        # 模式切换按钮组
         mode_group = QGroupBox("数据源")
         mode_layout = QHBoxLayout(mode_group)
         self.radio_folder = QRadioButton("📂 文件夹")
@@ -98,18 +98,22 @@ class MainWindow(QMainWindow):
         self.btn_load_json.setVisible(False)
         left_layout.addWidget(self.btn_load_json)
 
+        # 统计标签
         self.stats_label = QLabel("共 0 条数据")
         left_layout.addWidget(self.stats_label)
+
+        # 文件/数据列表
         self.file_list_widget = QListWidget()
         left_layout.addWidget(self.file_list_widget)
 
-        # === 中间面板 ===
+        # === 中间面板：画布 ===
         self.canvas = InteractiveCanvas()
 
-        # === 右侧面板 ===
+        # === 右侧面板：控制与信息 ===
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
 
+        # 元信息显示
         meta_group = QGroupBox("元信息")
         meta_layout = QVBoxLayout(meta_group)
         self.meta_text = QTextEdit()
@@ -118,6 +122,7 @@ class MainWindow(QMainWindow):
         meta_layout.addWidget(self.meta_text)
         right_layout.addWidget(meta_group)
 
+        # 操作说明
         info_label = QLabel(
             "<b>操作说明:</b><br>"
             "左键: 添加前景点 (预测)<br>"
@@ -133,56 +138,56 @@ class MainWindow(QMainWindow):
         tools_group = QGroupBox("工具箱")
         tools_layout = QVBoxLayout(tools_group)
 
-        # 第一行：按钮 (现在有4个)
-        btns_layout = QHBoxLayout()
+        # 1. 按钮区域 (使用 Grid 布局，2行2列，节省宽度)
+        btns_grid = QGridLayout()
 
-        # 1. SAM
+        # 定义按钮
         self.btn_tool_sam = QPushButton("🎯 SAM (点选)")
         self.btn_tool_sam.setCheckable(True)
         self.btn_tool_sam.setChecked(True)
         self.btn_tool_sam.clicked.connect(lambda: self.switch_tool("sam"))
 
-        # 2. 擦除
         self.btn_tool_erase = QPushButton("🔲 框选擦除")
         self.btn_tool_erase.setCheckable(True)
         self.btn_tool_erase.clicked.connect(lambda: self.switch_tool("eraser"))
 
-        # 3. 画笔
         self.btn_tool_brush = QPushButton("🖌️ 画笔微调")
         self.btn_tool_brush.setCheckable(True)
         self.btn_tool_brush.clicked.connect(lambda: self.switch_tool("brush"))
 
-        # 4. 【新增】套索填充按钮
         self.btn_tool_polygon = QPushButton("➰ 套索填充")
         self.btn_tool_polygon.setCheckable(True)
         self.btn_tool_polygon.clicked.connect(lambda: self.switch_tool("polygon"))
 
-        # 互斥按钮组
+        # 互斥组
         self.tool_btn_group = QButtonGroup()
         self.tool_btn_group.addButton(self.btn_tool_sam)
         self.tool_btn_group.addButton(self.btn_tool_erase)
         self.tool_btn_group.addButton(self.btn_tool_brush)
-        self.tool_btn_group.addButton(self.btn_tool_polygon)  # 添加到组
+        self.tool_btn_group.addButton(self.btn_tool_polygon)
         self.tool_btn_group.setExclusive(True)
 
-        btns_layout.addWidget(self.btn_tool_sam)
-        btns_layout.addWidget(self.btn_tool_erase)
-        btns_layout.addWidget(self.btn_tool_brush)
-        btns_layout.addWidget(self.btn_tool_polygon)  # 添加到布局
+        # 添加到网格 (行, 列)
+        btns_grid.addWidget(self.btn_tool_sam, 0, 0)
+        btns_grid.addWidget(self.btn_tool_erase, 0, 1)
+        btns_grid.addWidget(self.btn_tool_brush, 1, 0)
+        btns_grid.addWidget(self.btn_tool_polygon, 1, 1)
 
-        tools_layout.addLayout(btns_layout)
+        tools_layout.addLayout(btns_grid)
 
-        # 第二行：画笔大小
-        size_layout = QHBoxLayout()
+        # 2. 画笔大小控制区 (默认隐藏容器)
+        self.brush_control_widget = QWidget()
+        size_layout = QHBoxLayout(self.brush_control_widget)
+        size_layout.setContentsMargins(0, 5, 0, 0)
+
         size_layout.addWidget(QLabel("🖌️ 大小:"))
         self.slider_brush = QSlider(Qt.Orientation.Horizontal)
         self.slider_brush.setRange(1, 100)
         self.slider_brush.setValue(self.brush_radius)
-        self.slider_brush.setEnabled(False)
+
         self.spin_brush = QSpinBox()
         self.spin_brush.setRange(1, 100)
         self.spin_brush.setValue(self.brush_radius)
-        self.spin_brush.setEnabled(False)
 
         self.slider_brush.valueChanged.connect(self.spin_brush.setValue)
         self.slider_brush.valueChanged.connect(self.set_brush_radius)
@@ -190,7 +195,10 @@ class MainWindow(QMainWindow):
 
         size_layout.addWidget(self.slider_brush)
         size_layout.addWidget(self.spin_brush)
-        tools_layout.addLayout(size_layout)
+
+        # 将大小控制容器加入布局，并默认隐藏
+        tools_layout.addWidget(self.brush_control_widget)
+        self.brush_control_widget.setVisible(False)
 
         right_layout.addWidget(tools_group)
 
@@ -201,11 +209,11 @@ class MainWindow(QMainWindow):
 
         # === 增删改操作按钮组 ===
         action_layout = QHBoxLayout()
-        self.btn_add_mask = QPushButton("➕ 确认添加 (Space)")
+        self.btn_add_mask = QPushButton("➕ 确认 (Space)")
         self.btn_add_mask.setStyleSheet("background-color: #5cb85c; color: white; font-weight: bold;")
         self.btn_add_mask.clicked.connect(self.apply_sam_merge)
 
-        self.btn_sub_mask = QPushButton("➖ 确认移除 (Del)")
+        self.btn_sub_mask = QPushButton("➖ 移除 (Del)")
         self.btn_sub_mask.setStyleSheet("background-color: #d9534f; color: white; font-weight: bold;")
         self.btn_sub_mask.clicked.connect(self.apply_sam_subtract)
 
@@ -240,23 +248,28 @@ class MainWindow(QMainWindow):
 
         right_layout.addStretch()
 
-        # 导航/删除/保存按钮 (省略详细样式配置以节省空间，保持原样即可)
+        # 导航按钮
         nav_layout = QHBoxLayout()
+        nav_btn_style = "QPushButton { height: 40px; font-size: 14px; font-weight: bold; }"
         self.btn_prev = QPushButton("<< 上一条")
+        self.btn_prev.setStyleSheet(nav_btn_style)
         self.btn_prev.clicked.connect(self.navigate_prev)
         self.btn_next = QPushButton("下一条 >>")
+        self.btn_next.setStyleSheet(nav_btn_style)
         self.btn_next.clicked.connect(self.navigate_next)
         nav_layout.addWidget(self.btn_prev)
         nav_layout.addWidget(self.btn_next)
         right_layout.addLayout(nav_layout)
 
+        # 删除按钮
         self.btn_delete = QPushButton("🗑 删除当前条目")
         self.btn_delete.setStyleSheet("background-color: #d9534f; color: white; font-weight: bold;")
         self.btn_delete.clicked.connect(self.delete_current_item)
         right_layout.addWidget(self.btn_delete)
 
+        # 保存按钮
         self.btn_save = QPushButton("💾 保存修改")
-        self.btn_save.setStyleSheet("background-color: #5cb85c; color: white; font-weight: bold;")
+        self.btn_save.setStyleSheet("background-color: #5cb85c; color: white; height: 40px; font-weight: bold;")
         self.btn_save.clicked.connect(self.save_current)
         right_layout.addWidget(self.btn_save)
 
@@ -267,9 +280,11 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(splitter)
 
     # ==========================
-    # 模式切换与加载逻辑 (保持不变)
+    # 模式切换
     # ==========================
+
     def on_mode_changed(self):
+        """切换文件夹/JSON模式"""
         if self.radio_folder.isChecked():
             self.current_mode = "folder"
             self.btn_load_dir.setVisible(True)
@@ -278,6 +293,7 @@ class MainWindow(QMainWindow):
             self.current_mode = "json"
             self.btn_load_dir.setVisible(False)
             self.btn_load_json.setVisible(True)
+
         self.file_list_widget.clear()
         self.stats_label.setText("共 0 条数据")
         self.canvas.set_image(None)
@@ -288,6 +304,10 @@ class MainWindow(QMainWindow):
         self.translated_text.clear()
         self.base_mask = None
         self.sam_mask = None
+
+    # ==========================
+    # 文件夹模式
+    # ==========================
 
     def load_folder_action(self):
         folder = QFileDialog.getExistingDirectory(self, "选择数据集目录")
@@ -524,7 +544,8 @@ class MainWindow(QMainWindow):
             for k in ['visual_prompt_path', 'training_mask_path', 'mask_path']:
                 if p := item.get(k):
                     try:
-                        os.remove(p); print(f"已删除: {p}")
+                        os.remove(p);
+                        print(f"已删除: {p}")
                     except:
                         pass
             self.json_data.pop(self.json_current_index)
@@ -573,7 +594,8 @@ class MainWindow(QMainWindow):
         try:
             self._auto_translate(text)
         finally:
-            self.btn_translate.setEnabled(True); self.btn_translate.setText("🌐 翻译为中文")
+            self.btn_translate.setEnabled(True);
+            self.btn_translate.setText("🌐 翻译为中文")
 
     def _auto_translate(self, text):
         if not text.strip(): self.translated_text.clear(); return
@@ -589,8 +611,12 @@ class MainWindow(QMainWindow):
     def switch_tool(self, mode):
         """切换画布模式"""
         self.canvas.set_mode(mode)
-        self.slider_brush.setEnabled(mode == "brush")
-        self.spin_brush.setEnabled(mode == "brush")
+
+        # 核心逻辑：只有在 brush 模式下，才显示大小控制容器
+        if mode == "brush":
+            self.brush_control_widget.setVisible(True)
+        else:
+            self.brush_control_widget.setVisible(False)
 
         tips = {
             "sam": "SAM模式：左键=前景点，右键=背景点。",
